@@ -2,12 +2,16 @@
 
 ## Обзор
 
-{{ ydb-short-name }} не предоставляет единого «коробочного» коннектора для двунаправленной репликации с PostgreSQL. Для **near real-time** инкрементальной синхронизации используется связка стандартных инструментов CDC и встроенных возможностей {{ ydb-short-name }}:
+{{ ydb-short-name }} не предоставляет единого «коробочного» коннектора для двунаправленной репликации с PostgreSQL. Для **near real-time** инкрементальной синхронизации используется связка стандартных инструментов CDC и встроенных возможностей {{ ydb-short-name }}.
+
+**Среда выполнения коннекторов** — [Kafka Connect](https://kafka.apache.org/documentation/#connect): stateless Java-приложение (worker), которое поднимается в Docker и исполняет плагины-коннекторы. И **Debezium PostgreSQL Connector**, и **JDBC Sink Connector** — это плагины поверх одного и того же worker'а, а не отдельные сервисы.
+
+**Хранилище данных и служебного состояния** — {{ ydb-short-name }} через [Kafka API](../../reference/kafka-api/index.md): топики changefeed/Debezium для потока изменений и служебные топики Connect (`connect-offsets`, `connect-configs`, `connect-status`) для offset'ов и конфигурации. Отдельный брокер Kafka для POC и production-пайплайна не обязателен.
 
 | Направление | Цепочка | Роль {{ ydb-short-name }} |
 | --- | --- | --- |
-| **PostgreSQL → {{ ydb-short-name }}** | Debezium PostgreSQL Connector → [топик](../../concepts/datamodel/topic.md) (Kafka API) → [TRANSFER](../../concepts/transfer.md) | Приём изменений в таблицы |
-| **{{ ydb-short-name }} → PostgreSQL** | [CDC changefeed](../../concepts/cdc.md) → топик (Kafka API) → Kafka Connect JDBC Sink | Источник изменений |
+| **PostgreSQL → {{ ydb-short-name }}** | Kafka Connect (Debezium Source) → [топик](../../concepts/datamodel/topic.md) → [TRANSFER](../../concepts/transfer.md) | Топики данных + state Connect |
+| **{{ ydb-short-name }} → PostgreSQL** | [CDC changefeed](../../concepts/cdc.md) → топик → Kafka Connect (JDBC Sink) | Топики данных + state Connect |
 
 Для **начальной (полной) загрузки** из PostgreSQL используйте [YDB Importer](import-jdbc.md). Для ad-hoc чтения без репликации — [федеративные запросы](../../concepts/query_execution/federated_query/postgresql.md) (только `SELECT`, не для регулярного ETL).
 
@@ -76,6 +80,61 @@ CREATE TABLE user_payments (
 
 ---
 
+## Kafka Connect как платформа {#kafka-connect-platform}
+
+[Kafka Connect](https://kafka.apache.org/documentation/#connect) — распределённая **stateless**-обёртка над коннекторами. Worker не хранит offset'ы и конфигурацию локально (кроме in-memory кеша): при рестарте контейнера состояние поднимается из топиков.
+
+```mermaid
+flowchart LR
+  subgraph KC["Kafka Connect worker (Docker)"]
+    DBZ["Debezium Source plugin"]
+    JDBC["JDBC Sink plugin"]
+  end
+
+  PG[(PostgreSQL)]
+  YDBT["YDB Topics\n(data + connect-*)"]
+  YDBTBL[(YDB Tables)]
+  TR[TRANSFER]
+
+  PG --> DBZ
+  DBZ --> YDBT
+  YDBT --> TR --> YDBTBL
+  YDBTBL --> CF[changefeed] --> YDBT
+  YDBT --> JDBC --> PG
+  KC <-->|offsets, config, status| YDBT
+```
+
+**Типы топиков в {{ ydb-short-name }}:**
+
+| Топик | Назначение |
+| --- | --- |
+| `dbz.shop.user_orders`, … | Поток изменений (данные) |
+| `connect-offsets` | Offset'ы source/sink коннекторов |
+| `connect-configs` | Конфигурация коннекторов |
+| `connect-status` | Статус задач worker'а |
+
+Служебные топики создайте до первого запуска worker'а. Минимальная конфигурация worker'а ([подробнее](../../reference/kafka-api/connect/connect-step-by-step.md)):
+
+```ini
+bootstrap.servers=ydb:9092
+consumer.check.crcs=false
+
+# Хранение state Connect в YDB Topics
+config.storage.topic=connect-configs
+offset.storage.topic=connect-offsets
+status.storage.topic=connect-status
+config.storage.replication.factor=1
+offset.storage.replication.factor=1
+status.storage.replication.factor=1
+
+key.converter=org.apache.kafka.connect.storage.StringConverter
+value.converter=org.apache.kafka.connect.storage.StringConverter
+```
+
+Один worker может одновременно исполнять Debezium Source (PG→топик) и JDBC Sink (топик→PG) — для изоляции направлений на практике чаще поднимают два worker'а с разными `GROUP_ID`, но оба могут использовать один {{ ydb-short-name }} как `bootstrap.servers`.
+
+---
+
 ## PostgreSQL → {{ ydb-short-name }}
 
 ### Архитектура
@@ -83,13 +142,16 @@ CREATE TABLE user_payments (
 ```mermaid
 sequenceDiagram
   participant PG as PostgreSQL
-  participant DBZ as Debezium Connect
+  participant KC as Kafka Connect worker
+  participant DBZ as Debezium Source plugin
   participant Topic as YDB Topic (Kafka API)
   participant TR as TRANSFER
   participant YDB as YDB Table
 
   PG->>DBZ: WAL (logical replication)
-  DBZ->>Topic: Debezium envelope (JSON)
+  DBZ->>KC: run inside worker
+  KC->>Topic: Debezium envelope (JSON)
+  Note over KC,Topic: offset → connect-offsets
   Topic->>TR: read by consumer
   TR->>YDB: UPSERT (lambda)
 ```
@@ -97,9 +159,10 @@ sequenceDiagram
 **Компоненты:**
 
 1. **PostgreSQL** — источник транзакций; logical decoding через `pgoutput`.
-2. **[Debezium PostgreSQL Connector](https://debezium.io/documentation/reference/stable/connectors/postgresql.html)** — читает WAL, публикует изменения в топики.
-3. **[Kafka API](../../reference/kafka-api/index.md)** — {{ ydb-short-name }} принимает запись в [топики](../../concepts/datamodel/topic.md) по протоколу, совместимому с Apache Kafka.
-4. **[TRANSFER](../../concepts/transfer.md)** — асинхронно читает топик, преобразует сообщения lambda-функцией и выполняет UPSERT в целевую таблицу.
+2. **[Kafka Connect worker](https://kafka.apache.org/documentation/#connect)** — stateless Java-процесс в Docker; исполняет плагины.
+3. **[Debezium PostgreSQL Connector](https://debezium.io/documentation/reference/stable/connectors/postgresql.html)** — source-плагин Connect; читает WAL, публикует изменения в топики. Offset'ы хранятся в `connect-offsets` в {{ ydb-short-name }}.
+4. **[Kafka API](../../reference/kafka-api/index.md)** — {{ ydb-short-name }} принимает запись в [топики](../../concepts/datamodel/topic.md) по протоколу, совместимому с Apache Kafka.
+5. **[TRANSFER](../../concepts/transfer.md)** — асинхронно читает топик, преобразует сообщения lambda-функцией и выполняет UPSERT в целевую таблицу.
 
 Альтернатива TRANSFER — [ydb-kafka-sink-connector](https://github.com/ydb-platform/ydb-kafka-sink-connector); TRANSFER предпочтительнее, если преобразование выполняется в YQL на стороне {{ ydb-short-name }}.
 
@@ -206,20 +269,24 @@ sequenceDiagram
   participant YDB as YDB Table
   participant CF as CDC Changefeed
   participant Topic as YDB Topic (Kafka API)
-  participant KC as Kafka Connect JDBC Sink
+  participant KC as Kafka Connect worker
+  participant JDBC as JDBC Sink plugin
   participant PG as PostgreSQL
 
   YDB->>CF: INSERT/UPDATE/DELETE
   CF->>Topic: DEBEZIUM_JSON
-  Topic->>KC: consume
+  Topic->>JDBC: consume
+  JDBC->>KC: run inside worker
   KC->>PG: UPSERT
+  Note over KC,Topic: offset → connect-offsets
 ```
 
 **Компоненты:**
 
 1. **Строковая таблица {{ ydb-short-name }}** — источник OLTP-изменений.
 2. **[CDC changefeed](../../concepts/cdc.md)** — формирует поток изменений в топик; гарантии exactly-once в пределах ключа.
-3. **Kafka Connect + JDBC Sink** — читает топик через Kafka API, записывает в PostgreSQL ([пример конфигурации](../../reference/kafka-api/connect/connect-examples.md)).
+3. **[Kafka Connect worker](https://kafka.apache.org/documentation/#connect)** — stateless Java-процесс в Docker.
+4. **JDBC Sink Connector** — sink-плагин Connect; читает changefeed-топик через Kafka API, записывает в PostgreSQL ([пример конфигурации](../../reference/kafka-api/connect/connect-examples.md)).
 
 ### Changefeed на источнике
 
@@ -245,18 +312,11 @@ ALTER TABLE user_payments ADD CHANGEFEED payments_cf WITH (
 ydb scheme describe user_orders
 ```
 
-### Kafka Connect worker
+### Kafka Connect worker (JDBC Sink)
 
-Минимальные настройки для чтения из {{ ydb-short-name }}:
+Worker использует ту же конфигурацию, что в разделе [Kafka Connect как платформа](#kafka-connect-platform): `bootstrap.servers=ydb:9092`, служебные топики `connect-*` в {{ ydb-short-name }}.
 
-```ini
-bootstrap.servers=ydb:9092
-consumer.check.crcs=false
-key.converter=org.apache.kafka.connect.storage.StringConverter
-value.converter=org.apache.kafka.connect.storage.StringConverter
-```
-
-Перед запуском sink создайте [читателя топика](../../reference/ydb-cli/topic-consumer-add.md) с именем, совпадающим с `group.id` коннектора (см. [пошаговую инструкцию](../../reference/kafka-api/connect/connect-step-by-step.md)).
+Перед запуском sink создайте [читателя топика](../../reference/ydb-cli/topic-consumer-add.md) changefeed с именем, совпадающим с `group.id` коннектора (см. [пошаговую инструкцию](../../reference/kafka-api/connect/connect-step-by-step.md)).
 
 ### JDBC Sink в PostgreSQL
 
@@ -292,8 +352,9 @@ transforms.unwrap.delete.handling.mode=rewrite
 | --- | --- | --- |
 | {{ ydb-short-name }} | `ydbplatform/local-ydb:latest` | 2136 (gRPC), 8765 (UI), 9092 (Kafka API) |
 | PostgreSQL | `postgres:16` | 5432 |
-| Debezium Connect | `debezium/connect:2.7` | 8083 (REST) — для PG→YDB |
-| Kafka Connect | `confluentinc/cp-kafka-connect:7.6.0` + JDBC plugin | 8083 — для YDB→PG |
+| Kafka Connect | `debezium/connect:2.7` (+ JDBC plugin при YDB→PG) | 8083 (REST) |
+
+Образ `debezium/connect` уже содержит Kafka Connect worker и Debezium Source. Для направления YDB→PG установите [JDBC Sink plugin](https://www.confluent.io/hub/confluentinc/kafka-connect-jdbc) в тот же worker — отдельный брокер Kafka не нужен: и данные, и state Connect (`connect-offsets`, `connect-configs`, `connect-status`) хранятся в топиках {{ ydb-short-name }}.
 
 Запуск {{ ydb-short-name }} в Docker — см. [инструкцию](../../reference/docker/start.md). Kafka API доступен на порту **9092** без SASL при анонимной аутентификации.
 
@@ -329,7 +390,7 @@ transforms.unwrap.delete.handling.mode=rewrite
 | Риск | Рекомендация |
 | --- | --- |
 | TRANSFER не удаляет строки | Soft-delete или периодический `DELETE` |
-| Debezium не пишет напрямую в YDB Kafka API | Промежуточный брокер (Redpanda/Kafka) или проверка совместимости |
+| Несовместимость отдельных API Kafka Connect с YDB Kafka API | Проверить на POC; при необходимости — промежуточный брокер только для проблемного коннектора |
 | DELETE в {{ ydb-short-name }} не отражается в PG | Настроить `ExtractNewRecordState` + `delete.handling.mode` |
 | Out-of-order доставка payments/orders | Без FK в PG-приёмнике или deferrable constraints |
 | Двунаправленная запись в одни таблицы | Раздельные master-системы, разрешение конфликтов на уровне приложения |
@@ -352,10 +413,10 @@ transforms.unwrap.delete.handling.mode=rewrite
 ## Краткие ответы
 
 **Как организовать инкремент PG → {{ ydb-short-name }}?**  
-Debezium (logical replication) → топик {{ ydb-short-name }} (Kafka API) → `CREATE TRANSFER` с lambda под Debezium envelope.
+Kafka Connect (Debezium Source, state в топиках {{ ydb-short-name }}) → топик данных → `CREATE TRANSFER` с lambda под Debezium envelope.
 
 **Как организовать инкремент {{ ydb-short-name }} → PG?**  
-`ADD CHANGEFEED` (`DEBEZIUM_JSON`, `INITIAL_SCAN`) → Kafka Connect JDBC Sink → PostgreSQL.
+`ADD CHANGEFEED` (`DEBEZIUM_JSON`, `INITIAL_SCAN`) → Kafka Connect (JDBC Sink plugin) → PostgreSQL.
 
 **Есть ли готовый двунаправленный sync?**  
 Нет. Собирается из двух однонаправленных пайплайнов с явной моделью master/replica.
