@@ -3,3 +3,5 @@ items:
   href: import-jdbc.md
 - name: Импорт из MySQL
   href: import-mysql.md
+- name: Инкрементальная синхронизация PostgreSQL через CDC
+  href: postgresql-cdc-sync.md
