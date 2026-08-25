@@ -73,6 +73,12 @@
 
 {% endnote %}
 
+{% note warning %}
+
+Инкрементальный бэкап **не обеспечивает RPO=0**: изменения непрерывно пишутся в CDC после коммита, а точки восстановления появляются только при материализации (`BACKUP … INCREMENTAL`). Подробный разбор — в [{#T}](incremental-backup-rpo.md).
+
+{% endnote %}
+
 ## Резервное копирование системных таблеток {#system-tablet-backup}
 
 {% note info %}
@@ -132,8 +138,8 @@
 
 - [Резервное копирование и восстановление](../devops/backup-and-recovery/index.md) — практическое руководство
 - [Коллекции резервных копий](datamodel/backup-collection.md) — архитектура и ограничения
+- [Инкрементальный бэкап и RPO=0](incremental-backup-rpo.md) — почему RPO≠0 и какие альтернативы ближе к нулю
 - [Рецепты для резервного копирования системных таблеток](../recipes/system-tablet-backup/index.md) — включение и восстановление
-- [Резервное копирование и восстановление](../devops/backup-and-recovery/index.md) — практическое руководство
 - [Справочник export/import](../reference/ydb-cli/export-import/index.md) — команды CLI
 - Справочник YQL:
   - [`CREATE BACKUP COLLECTION`](../yql/reference/syntax/create-backup-collection.md)
