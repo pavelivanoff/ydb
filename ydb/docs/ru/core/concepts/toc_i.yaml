@@ -42,6 +42,8 @@ items:
   href: limits-ydb.md
 - name: Резервное копирование и восстановление
   href: backup.md
+- name: Инкрементальный бэкап и RPO=0
+  href: incremental-backup-rpo.md
 - name: Асинхронная репликация
   href: async-replication.md
 - name: Режим bridge
